@@ -187,24 +187,27 @@ describe('atomic publication', () => {
   it('starts delivery age at publication inside an older caller transaction', async () => {
     await store.createEndpoint('scope-a', input)
     const client = await pool.connect()
+    let eventId: string
     try {
       await client.query('BEGIN')
       await client.query('SELECT pg_sleep(0.15)')
-      await store.publish('scope-a', event, { transaction: client })
+      const publication = await store.publish('scope-a', event, { transaction: client })
+      eventId = publication.eventId
       await client.query('COMMIT')
     } finally {
       await client.query('ROLLBACK')
       client.release()
     }
-    // The 150ms sleep runs before publish, so only the publication statement sets the window.
-    // maxAgeMs stays below that sleep: were the window taken from the transaction start, the
-    // delivery would already be too old to claim. Assert the age itself rather than relying on a
-    // real wait, so a slow runner that stretches the gap before claim() cannot fail the test.
-    const { claims } = await createWorkerStore(testConfig({ maxAgeMs: 100 })).claim()
-    expect(claims).toHaveLength(1)
-    const claim = claims[0]!
-    expect(claim.windowStartedAt.getTime()).toBeGreaterThanOrEqual(claim.eventCreatedAt.getTime())
-    expect(claim.windowStartedAt.getTime() - claim.eventCreatedAt.getTime()).toBeLessThan(150)
+    // The sleep makes the transaction start older than publication. Compare the stored
+    // timestamps without racing the worker's expiry check after COMMIT.
+    const { rows } = await pool.query(
+      `SELECT (d.window_started_at = d.created_at AND d.window_started_at >= e.created_at)
+         AS starts_at_publication
+       FROM public.webhook_deliveries d JOIN public.webhook_events e ON e.id=d.event_id
+       WHERE e.id=$1`,
+      [eventId],
+    )
+    expect(rows).toEqual([{ starts_at_publication: true }])
   })
 
   it('fans out only to matching scope subscriptions, includes paused endpoints, and excludes deleted endpoints', async () => {
